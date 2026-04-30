@@ -283,11 +283,10 @@ class DualRealsense:
         if self.ee_serial is None:
             print("[cam ] WARNING D405 (gripper) not found")
 
-        # D435if (head) is on USB 3.0 — full bandwidth available
-        # D405 (ee) is on USB 2.0 — give it lighter config (15fps, no depth
-        # by default; --save_depth flag would override but most recording
-        # doesn't need depth anyway)
-        self.head_pipe = self._make_pipeline(self.head_serial, fps=30, want_depth=True) \
+        # Both cameras at 15 fps — matches our 15 Hz recording loop, so no
+        # wasted frames / bandwidth.  Head keeps depth (USB 3.0 has room),
+        # EE drops depth (USB 2.0 + we record RGB only by default).
+        self.head_pipe = self._make_pipeline(self.head_serial, fps=15, want_depth=True) \
                          if self.head_serial else None
         self.ee_pipe   = self._make_pipeline(self.ee_serial,   fps=15, want_depth=False) \
                          if self.ee_serial   else None
@@ -653,6 +652,17 @@ def main():
                          "RoboCasa stores but model still resizes to 224 at "
                          "training (lossy). 0 = keep camera native 640x480 "
                          "(max flexibility, ~6.7x bigger files).")
+    ap.add_argument("--head_rotate", type=int, default=90,
+                    choices=[0, 90, 180, 270],
+                    help="rotate head image clockwise by N degrees before "
+                         "saving. Stretch's D435if is mounted sideways so the "
+                         "raw image is rotated; default 90 corrects to "
+                         "upright.")
+    ap.add_argument("--video_crf", type=int, default=20,
+                    help="ffmpeg h264 CRF (lower = better quality, bigger "
+                         "file). 18=visually lossless, 23=ffmpeg default, "
+                         "30=FileDataRecorder default (too lossy for VLA). "
+                         "Our default 20 = high quality.")
     args = ap.parse_args()
 
     dt = 1.0 / args.fps
@@ -679,9 +689,49 @@ def main():
         task=args.task, user=args.user, env=args.env,
         save_images=False,
         metadata={"task": args.task, "user": args.user, "env": args.env,
-                  "leader": "robot_gamepad", "fps": args.fps},
+                  "leader": "robot_gamepad", "fps": args.fps,
+                  "video_crf": args.video_crf,
+                  "head_rotate_deg": args.head_rotate,
+                  "image_size": args.image_size or "native"},
         fps=args.fps,
     )
+
+    # Monkey-patch the recorder's video-encoding step to use OUR crf
+    # (FileDataRecorder hardcodes crf=30 which is too aggressive for VLA).
+    _orig_proc_rgb = recorder.process_rgb_to_video
+
+    def _proc_rgb_with_crf(episode_dir, head=False, *args_, **kwargs):
+        # Re-implement just enough to substitute crf
+        import subprocess
+        if head:
+            from stretch.utils.data_tools.record import (
+                HEAD_RGB_FOLDER_NAME as RGB_FOLDER,
+                HEAD_RGB_VIDEO_H264_NAME as VIDEO_NAME,
+            )
+        else:
+            from stretch.utils.data_tools.record import (
+                RGB_FOLDER_NAME as RGB_FOLDER,
+                RGB_VIDEO_H264_NAME as VIDEO_NAME,
+            )
+        rgb_dir = episode_dir / RGB_FOLDER
+        video_path = episode_dir / VIDEO_NAME
+        try:
+            sample = next(rgb_dir.glob("*.png"))
+        except StopIteration:
+            return
+        fmt = "%06d.png" if len(sample.stem) == 6 else "%04d.png"
+        cmd = [
+            "ffmpeg", "-y", "-framerate", str(args.fps),
+            "-i", str(rgb_dir / fmt),
+            "-c:v", "libx264", "-crf", str(args.video_crf),
+            "-pix_fmt", "yuv420p",
+            "-loglevel", "error",
+            str(video_path),
+        ]
+        subprocess.run(cmd, check=True)
+        print(f"[REC ] encoded {video_path.name} (crf={args.video_crf})")
+
+    recorder.process_rgb_to_video = _proc_rgb_with_crf
     console = ConsoleInput()
 
     recording  = False
@@ -718,6 +768,13 @@ def main():
 
             # 4) Read cameras (always; cheap if no record)
             head_rgb, head_depth, ee_rgb, ee_depth = cams.read()
+
+            # 4a) Rotate head camera (D435if is sideways-mounted on Stretch)
+            if args.head_rotate and head_rgb is not None:
+                k = args.head_rotate // 90      # CW: 1, 2, or 3
+                head_rgb = np.rot90(head_rgb, k=-k).copy()
+                if head_depth is not None:
+                    head_depth = np.rot90(head_depth, k=-k).copy()
 
             # 4b) Optional pre-resize for direct VLA target size
             if args.image_size > 0:
@@ -928,8 +985,10 @@ def _make_stitched_video(episode_dir):
         "-i", str(head_mp4),
         "-i", str(gripper_mp4),
         "-filter_complex",
-        # pad both to same height, then horizontally stack
-        "[0:v][1:v]hstack=inputs=2[v]",
+        # Normalize both to 480 height (preserves aspect), then hstack.
+        # Required because head is rotated (480x640) and ee is (480x640
+        # too, or possibly different shapes).
+        "[0:v]scale=-2:480[v0];[1:v]scale=-2:480[v1];[v0][v1]hstack=inputs=2[v]",
         "-map", "[v]",
         "-c:v", "libx264", "-crf", "28",
         "-loglevel", "error",
