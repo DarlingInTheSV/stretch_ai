@@ -283,8 +283,14 @@ class DualRealsense:
         if self.ee_serial is None:
             print("[cam ] WARNING D405 (gripper) not found")
 
-        self.head_pipe = self._make_pipeline(self.head_serial) if self.head_serial else None
-        self.ee_pipe   = self._make_pipeline(self.ee_serial)   if self.ee_serial   else None
+        # D435if (head) is on USB 3.0 — full bandwidth available
+        # D405 (ee) is on USB 2.0 — give it lighter config (15fps, no depth
+        # by default; --save_depth flag would override but most recording
+        # doesn't need depth anyway)
+        self.head_pipe = self._make_pipeline(self.head_serial, fps=30, want_depth=True) \
+                         if self.head_serial else None
+        self.ee_pipe   = self._make_pipeline(self.ee_serial,   fps=15, want_depth=False) \
+                         if self.ee_serial   else None
 
         # Cache of last-good frame per camera; consumers always get
         # a non-None RGB/depth (stale-but-valid > black).
@@ -294,29 +300,47 @@ class DualRealsense:
         self._last_ee_depth   = None
 
         # Prime cache by blocking-wait for first frame from each camera.
-        # poll_for_frames() may return empty for many seconds after
-        # pipeline.start(), so we must wait_for_frames here at least once
-        # to guarantee the cache is populated before the main loop begins.
-        for label, pipe in (("head", self.head_pipe), ("ee", self.ee_pipe)):
+        # 10s timeout — D405 on USB 2.0 can be slow to start streaming.
+        for label, pipe_attr in (("head", "head_pipe"), ("ee", "ee_pipe")):
+            pipe = getattr(self, pipe_attr)
             if pipe is None:
                 continue
-            try:
-                f = pipe.wait_for_frames(5000)
-                cf = f.get_color_frame()
-                df = f.get_depth_frame()
-                if cf and df:
-                    color = np.asanyarray(cf.get_data()).copy()
-                    depth = np.asanyarray(df.get_data()).copy()
-                    if label == "head":
-                        self._last_head_color, self._last_head_depth = color, depth
-                    else:
-                        self._last_ee_color, self._last_ee_depth = color, depth
-                    print(f"[cam ] {label} primed: shape={color.shape} "
-                          f"mean={color.mean():.0f}")
-                else:
-                    print(f"[cam ] {label} got composite but no color/depth frame")
-            except Exception as e:
-                print(f"[cam ] {label} wait_for_frames failed: {e}")
+            primed = False
+            for attempt in range(2):  # retry once with lighter config
+                try:
+                    f = pipe.wait_for_frames(10000)
+                    cf = f.get_color_frame()
+                    if cf:
+                        color = np.asanyarray(cf.get_data()).copy()
+                        depth = None
+                        df = f.get_depth_frame()
+                        if df:
+                            depth = np.asanyarray(df.get_data()).copy()
+                        if label == "head":
+                            self._last_head_color = color
+                            self._last_head_depth = depth
+                        else:
+                            self._last_ee_color = color
+                            self._last_ee_depth = depth
+                        print(f"[cam ] {label} primed: shape={color.shape} "
+                              f"mean={color.mean():.0f}"
+                              + ("" if depth is None else "  +depth"))
+                        primed = True
+                        break
+                except Exception as e:
+                    print(f"[cam ] {label} wait_for_frames attempt {attempt+1} failed: {e}")
+                    # retry: stop, create lighter pipeline (RGB-only @ 15fps), re-prime
+                    if attempt == 0:
+                        try: pipe.stop()
+                        except: pass
+                        sn = self.head_serial if label == "head" else self.ee_serial
+                        pipe = self._make_pipeline(sn, fps=15, want_depth=False)
+                        if pipe is None:
+                            break
+                        setattr(self, pipe_attr, pipe)
+                        time.sleep(1.0)
+            if not primed:
+                print(f"[cam ] {label} FAILED to prime; will run with no {label} frames")
 
         # Brief poll-based warm-up after first frame, so subsequent polls
         # in the main loop have hot-path coverage.
@@ -325,37 +349,50 @@ class DualRealsense:
             time.sleep(0.03)
 
     @staticmethod
-    def _make_pipeline(serial):
-        pipe = rs.pipeline()
-        cfg = rs.config()
-        cfg.enable_device(serial)
-        cfg.enable_stream(rs.stream.color, CAM_RGB_W, CAM_RGB_H, rs.format.bgr8, CAM_RGB_FPS)
-        cfg.enable_stream(rs.stream.depth, CAM_DEPTH_W, CAM_DEPTH_H, rs.format.z16, CAM_DEPTH_FPS)
-        try:
-            pipe.start(cfg)
-        except Exception as e:
-            print(f"[cam ] pipeline start failed for serial {serial}: {e}")
-            return None
-        return pipe
+    def _make_pipeline(serial, *, want_depth=True, fps=30):
+        """Try a few configs, falling back to lighter ones if start fails."""
+        configs = [
+            # (rgb_size, depth_size, fps, with_depth)
+            ((CAM_RGB_W, CAM_RGB_H), (CAM_DEPTH_W, CAM_DEPTH_H), fps, want_depth),
+            ((CAM_RGB_W, CAM_RGB_H), (CAM_DEPTH_W, CAM_DEPTH_H), 15,  want_depth),
+            ((CAM_RGB_W, CAM_RGB_H), None,                       15,  False),  # RGB-only
+            ((424, 240),             None,                       15,  False),  # smaller RGB
+        ]
+        for (cw, ch), depth_dim, f, wd in configs:
+            pipe = rs.pipeline()
+            cfg = rs.config()
+            cfg.enable_device(serial)
+            cfg.enable_stream(rs.stream.color, cw, ch, rs.format.bgr8, f)
+            if wd and depth_dim:
+                dw, dh = depth_dim
+                cfg.enable_stream(rs.stream.depth, dw, dh, rs.format.z16, f)
+            try:
+                pipe.start(cfg)
+                d_str = f"+depth({depth_dim[0]}x{depth_dim[1]})" if (wd and depth_dim) else ""
+                print(f"[cam ] sn={serial} pipeline up: rgb={cw}x{ch}{d_str} @{f}fps")
+                return pipe
+            except Exception as e:
+                print(f"[cam ] sn={serial} cfg rgb={cw}x{ch} fps={f} depth={wd} failed: {e}")
+        return None
 
     def _grab(self, pipe):
-        """Return (color, depth) if a fresh frame is ready, else (None, None).
-
-        Uses poll_for_frames (non-blocking) so we don't stall the control loop.
+        """Return (color, depth) if a fresh frame is ready.
+        Depth is None if the pipeline doesn't have a depth stream enabled.
         """
         if pipe is None:
             return None, None
         try:
             frames = pipe.poll_for_frames()
-            # poll_for_frames returns a composite_frame; truthy iff frames present
             if not frames:
                 return None, None
             cf = frames.get_color_frame()
-            df = frames.get_depth_frame()
-            if not cf or not df:
+            if not cf:
                 return None, None
             color = np.asanyarray(cf.get_data()).copy()
-            depth = np.asanyarray(df.get_data()).copy()
+            depth = None
+            df = frames.get_depth_frame()
+            if df:
+                depth = np.asanyarray(df.get_data()).copy()
             return color, depth
         except Exception:
             return None, None
