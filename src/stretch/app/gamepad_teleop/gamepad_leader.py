@@ -8,14 +8,22 @@ Records data compatible with stretch_ai's FileDataRecorder format
 
 Usage
 -----
-On 5090 (with gamepad paired):
+Two gamepad source modes:
 
-    python -m stretch.app.gamepad_teleop.gamepad_leader \
-        --robot_ip 10.100.66.215 \
-        --task pickup_cup \
-        --user lsy \
-        --env office \
-        --data_dir ~/stretch_data
+  (A) local — gamepad plugged into the 5090 leader machine via USB:
+      python -m stretch.app.gamepad_teleop.gamepad_leader \
+          --gamepad_source local --task pickup_cup ...
+
+  (B) network — gamepad paired with the robot (e.g. via Bluetooth);
+                a relay process runs on the robot.  This is the
+                preferred mode when the leader (5090) is in a server
+                room while the operator is in the same room as robot:
+
+      # On robot:
+      python3 ~/stretch_ai/src/stretch/app/gamepad_teleop/gamepad_relay.py
+      # On 5090 (default --gamepad_source=network):
+      python -m stretch.app.gamepad_teleop.gamepad_leader \
+          --robot_ip 10.100.66.215 --task pickup_cup ...
 
 Controls (Xbox layout)
 ----------------------
@@ -56,6 +64,9 @@ try:
     HAS_EVDEV = True
 except ImportError:
     HAS_EVDEV = False
+
+import json
+import zmq
 
 
 # ── Robot joint limits (Stretch SE3) ──────────────────────────────────
@@ -218,6 +229,90 @@ class XboxController:
         self._thread.join(timeout=1.0)
 
 
+# ══ Network gamepad reader (subscribes to gamepad_relay on robot) ════
+class NetworkXboxController:
+    """Subscribes to a remote gamepad_relay over ZMQ.
+
+    Same interface as XboxController so it's drop-in compatible.
+    """
+
+    def __init__(self, sub_url: str = "tcp://10.100.66.215:4499",
+                 stale_warn_s: float = 2.0):
+        self.sub_url = sub_url
+        self.stale_warn_s = stale_warn_s
+
+        self.ctx = zmq.Context.instance()
+        self.sock = self.ctx.socket(zmq.SUB)
+        self.sock.setsockopt(zmq.CONFLATE, 1)        # only keep latest msg
+        self.sock.setsockopt_string(zmq.SUBSCRIBE, "")
+        self.sock.connect(sub_url)
+        print(f"[Gamepad/net] SUB connected to {sub_url}")
+
+        # State (same fields as XboxController)
+        self.left_x = 0.0
+        self.left_y = 0.0
+        self.right_x = 0.0
+        self.right_y = 0.0
+        self.lt = 0.0
+        self.rt = 0.0
+        self.dpad_x = 0
+        self.dpad_y = 0
+        self.btn = {k: 0 for k in
+                    ("A", "B", "X", "Y", "LB", "RB", "START", "BACK",
+                     "LSTICK", "RSTICK")}
+        self._prev_btn = dict(self.btn)
+        self.last_msg_ts = 0.0
+        self.last_warn_ts = 0.0
+
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def _loop(self):
+        poller = zmq.Poller()
+        poller.register(self.sock, zmq.POLLIN)
+        while not self._stop.is_set():
+            socks = dict(poller.poll(timeout=200))
+            if self.sock in socks:
+                try:
+                    raw = self.sock.recv_string(zmq.NOBLOCK)
+                    snap = json.loads(raw)
+                except Exception as e:
+                    print(f"[Gamepad/net] recv error: {e}")
+                    continue
+                self.left_x  = float(snap.get("left_x",  0.0))
+                self.left_y  = float(snap.get("left_y",  0.0))
+                self.right_x = float(snap.get("right_x", 0.0))
+                self.right_y = float(snap.get("right_y", 0.0))
+                self.lt      = float(snap.get("lt",      0.0))
+                self.rt      = float(snap.get("rt",      0.0))
+                self.dpad_x  = int(snap.get("dpad_x",  0))
+                self.dpad_y  = int(snap.get("dpad_y",  0))
+                self.btn.update(snap.get("btn", {}))
+                self.last_msg_ts = time.time()
+
+            # Periodic stale-link warning
+            now = time.time()
+            if (self.last_msg_ts > 0
+                and now - self.last_msg_ts > self.stale_warn_s
+                and now - self.last_warn_ts > 5.0):
+                print(f"[Gamepad/net] WARNING no relay msgs for "
+                      f"{now - self.last_msg_ts:.1f}s")
+                self.last_warn_ts = now
+
+    def edge_pressed(self, name):
+        was = self._prev_btn.get(name, 0)
+        now = self.btn.get(name, 0)
+        edge = (was == 0 and now == 1)
+        self._prev_btn[name] = now
+        return edge
+
+    def stop(self):
+        self._stop.set()
+        self._thread.join(timeout=1.0)
+        self.sock.close()
+
+
 # ══ Main leader class ════════════════════════════════════════════════
 class GamepadLeader:
     def __init__(
@@ -229,6 +324,8 @@ class GamepadLeader:
         data_dir: str,
         fps: int = 15,
         gamepad_device: Optional[str] = None,
+        gamepad_source: str = "local",   # "local" or "network"
+        gamepad_url: Optional[str] = None,  # used if gamepad_source=="network"
         save_images: bool = False,
     ):
         self.fps = fps
@@ -252,7 +349,11 @@ class GamepadLeader:
         time.sleep(1.0)
 
         # ── Gamepad ───────────────────────────────────────────────────
-        self.gp = XboxController(gamepad_device)
+        if gamepad_source == "network":
+            url = gamepad_url or f"tcp://{robot_ip}:4499"
+            self.gp = NetworkXboxController(url)
+        else:
+            self.gp = XboxController(gamepad_device)
 
         # ── Recorder ──────────────────────────────────────────────────
         self.task, self.user, self.env = task, user, env
@@ -580,9 +681,18 @@ class GamepadLeader:
 @click.option("--env",            default="default_env",    help="env name  (folder)")
 @click.option("--data_dir",       default="./data",         help="root dir for recordings")
 @click.option("--fps",            default=15,               help="control + record rate (Hz)")
-@click.option("--gamepad_device", default=None,             help="evdev path (auto-detect if None)")
+@click.option("--gamepad_source", type=click.Choice(["local", "network"]),
+              default="network",
+              help="gamepad input source: 'local' (USB to 5090) or "
+                   "'network' (relay running on robot)")
+@click.option("--gamepad_url",    default=None,
+              help="ZMQ SUB URL for network gamepad relay "
+                   "(default: tcp://<robot_ip>:4499)")
+@click.option("--gamepad_device", default=None,
+              help="evdev path (only for --gamepad_source local)")
 @click.option("--save_images",    is_flag=True,             help="keep raw png frames (debug)")
-def main(robot_ip, task, user, env, data_dir, fps, gamepad_device, save_images):
+def main(robot_ip, task, user, env, data_dir, fps,
+         gamepad_source, gamepad_url, gamepad_device, save_images):
     leader = GamepadLeader(
         robot_ip=robot_ip,
         task=task,
@@ -590,6 +700,8 @@ def main(robot_ip, task, user, env, data_dir, fps, gamepad_device, save_images):
         env=env,
         data_dir=data_dir,
         fps=fps,
+        gamepad_source=gamepad_source,
+        gamepad_url=gamepad_url,
         gamepad_device=gamepad_device,
         save_images=save_images,
     )
