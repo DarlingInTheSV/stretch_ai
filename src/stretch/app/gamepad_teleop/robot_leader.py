@@ -566,6 +566,13 @@ def main():
                     help="store full-resolution depth (slow on long episodes; "
                          "single-threaded liblzfse compression of GB-scale data "
                          "can take minutes on the robot CPU). Default off.")
+    ap.add_argument("--image_size", type=int, default=0,
+                    help="if >0, resize RGB to image_size x image_size before "
+                         "recording. Recommended: 224 (matches pi0.5 / OpenVLA "
+                         "PaliGemma SigLIP input directly). 128 is what "
+                         "RoboCasa stores but model still resizes to 224 at "
+                         "training (lossy). 0 = keep camera native 640x480 "
+                         "(max flexibility, ~6.7x bigger files).")
     args = ap.parse_args()
 
     dt = 1.0 / args.fps
@@ -632,6 +639,22 @@ def main():
             # 4) Read cameras (always; cheap if no record)
             head_rgb, head_depth, ee_rgb, ee_depth = cams.read()
 
+            # 4b) Optional pre-resize for direct VLA target size
+            if args.image_size > 0:
+                import cv2 as _cv
+                S = args.image_size
+                if head_rgb is not None:
+                    head_rgb = _cv.resize(head_rgb, (S, S), interpolation=_cv.INTER_AREA)
+                if ee_rgb is not None:
+                    ee_rgb = _cv.resize(ee_rgb, (S, S), interpolation=_cv.INTER_AREA)
+                if args.save_depth:
+                    if head_depth is not None:
+                        head_depth = _cv.resize(head_depth, (S, S),
+                                                interpolation=_cv.INTER_NEAREST)
+                    if ee_depth is not None:
+                        ee_depth = _cv.resize(ee_depth, (S, S),
+                                              interpolation=_cv.INTER_NEAREST)
+
             # 5) Compute action targets (= state + v×dt) for recording
             tgt = {
                 "joint_lift":         clip(state["lift"]        + vels["lift"]        * dt, LIFT_MIN, LIFT_MAX),
@@ -677,9 +700,12 @@ def main():
                     "base_v_yaw":      state["v_yaw"],
                 }
                 # FileDataRecorder requires non-None images; substitute zeros if missing
-                _zh = np.zeros((CAM_RGB_H, CAM_RGB_W, 3), dtype=np.uint8)
+                _S = args.image_size if args.image_size > 0 else None
+                _h = _S or CAM_RGB_H
+                _w = _S or CAM_RGB_W
+                _zh = np.zeros((_h, _w, 3), dtype=np.uint8)
                 if args.save_depth:
-                    _zd = np.zeros((CAM_DEPTH_H, CAM_DEPTH_W), dtype=np.uint16)
+                    _zd = np.zeros((_h, _w), dtype=np.uint16)
                     rec_ee_depth   = ee_depth   if ee_depth   is not None else _zd
                     rec_head_depth = head_depth if head_depth is not None else _zd
                 else:
