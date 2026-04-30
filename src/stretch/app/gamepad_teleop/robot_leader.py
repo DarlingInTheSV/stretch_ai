@@ -14,17 +14,16 @@ Gamepad mapping — modeled after stretch_gamepad_teleop daemon
   Left stick    X = base yaw       Y = base linear
   Right stick   X = arm extend     Y = lift
   LB / RB       wrist_yaw  (left = +, right = −)   ALWAYS
-  D-pad         wrist pitch + roll   (DEFAULT)
-                  ↕  toggle with X button  ↕
-                head pan + tilt
+  D-pad         wrist pitch (up/down) + roll (L/R)
   A button      close gripper  (hold)
   B button      open  gripper  (hold)
   L2 trigger    precision mode (velocities × 0.3 while held)
   R2 trigger    fast-base mode (base × 1.5  while held)
-  X button      TOGGLE D-pad function (wrist ↔ head)
+  X button      toggle head between 'ahead' and 'tool' (look at gripper)
   Y button      save SUCCESS  (record control)
-  BACK button   abandon current recording / print state
+  BACK button   print info
   START button  quit
+  LB+RB combo   toggle recording (start/pause)
 
 Console commands (typed during run):
   s, start    start a new recording episode
@@ -366,11 +365,15 @@ class StretchController:
         }
 
     # ─ Velocity command (per joint) ───────────────────────────────────
-    def send_velocities(self, v):
+    def send_velocities(self, v, skip_head: bool = False):
         """Send all per-joint velocities, then push_command once.
 
         Gripper uses move_by() like the daemon (set_velocity gets clamped
         early by Dynamixel internal target-update behavior).
+
+        skip_head: when True, don't send head set_velocity (used while
+        a head.pose() position-target move is settling, so we don't
+        override it with v=0).
         """
         # Hello-Motor lift / arm
         self.robot.lift.set_velocity(v.get("lift", 0.0), a_m=ACC_LIFT)
@@ -380,11 +383,14 @@ class StretchController:
         self.robot.base.set_velocity(v.get("base_v", 0.0),
                                      v.get("base_w", 0.0))
 
-        # Dynamixel chain — set_velocity for wrist + head
+        # Wrist Dynamixels via set_velocity
         for j in ("wrist_yaw", "wrist_pitch", "wrist_roll"):
             self.robot.end_of_arm.set_velocity(j, v.get(j, 0.0), a_r=ACC_WRIST)
-        for j in ("head_pan", "head_tilt"):
-            self.robot.head.set_velocity(j, v.get(j, 0.0), a_r=ACC_HEAD)
+
+        # Head — skipped during pose move so we don't fight the position target
+        if not skip_head:
+            for j in ("head_pan", "head_tilt"):
+                self.robot.head.set_velocity(j, v.get(j, 0.0), a_r=ACC_HEAD)
 
         # Gripper: daemon-style move_by (60 per call, max vel/accel)
         gv = v.get("gripper", 0.0)
@@ -404,6 +410,15 @@ class StretchController:
     def stop_all(self):
         self.send_velocities({})
 
+    def head_pose(self, name: str):
+        """Move head to a named pose (e.g. 'ahead', 'tool'). Returns ETA in seconds."""
+        try:
+            self.robot.head.pose(name)
+            return 1.5  # rough motion duration; suppress velocity-overrides this long
+        except Exception as e:
+            print(f"[motor] head.pose({name!r}) failed: {e}")
+            return 0.0
+
     def shutdown(self):
         try:
             self.stop_all()
@@ -416,14 +431,8 @@ class StretchController:
 #                  Gamepad → per-joint velocity mapping
 #                  (modeled after stretch_gamepad_teleop daemon)
 # ══════════════════════════════════════════════════════════════════════
-def map_gamepad(gp: XboxState, state: dict, dpad_to_wrist: bool) -> dict:
-    """
-    Args:
-        gp:               XboxState (current gamepad state)
-        state:            current robot joint readings
-        dpad_to_wrist:    True → D-pad controls wrist pitch+roll
-                          False → D-pad controls head pan+tilt
-    """
+def map_gamepad(gp: XboxState, state: dict) -> dict:
+    """Daemon-style mapping. D-pad always controls wrist pitch+roll."""
     # Modifier scaling
     precision  = gp.lt > 0.7      # L2 held → fine motion
     fast_base  = gp.rt > 0.7      # R2 held → faster base
@@ -445,15 +454,10 @@ def map_gamepad(gp: XboxState, state: dict, dpad_to_wrist: bool) -> dict:
     yaw_dir = (1 if gp.btn["LB"] else 0) - (1 if gp.btn["RB"] else 0)
     v_wy = yaw_dir * MAX_WRIST_V * p_scale
 
-    # ─ D-pad: wrist pitch+roll OR head pan+tilt (toggleable) ─────────
-    v_wp = v_wr = 0.0
-    v_hp = v_ht = 0.0
-    if dpad_to_wrist:
-        v_wp = gp.dpad_y * MAX_WRIST_V * p_scale          # up=+pitch
-        v_wr = gp.dpad_x * MAX_WRIST_V * p_scale          # right=+roll
-    else:
-        v_hp = gp.dpad_x * MAX_HEAD_V * p_scale           # right=+pan
-        v_ht = gp.dpad_y * MAX_HEAD_V * p_scale           # up=+tilt
+    # ─ D-pad → wrist pitch + roll (always) ──────────────────────────
+    v_wp = gp.dpad_y * MAX_WRIST_V * p_scale          # up=+pitch
+    v_wr = gp.dpad_x * MAX_WRIST_V * p_scale          # right=+roll
+    v_hp = v_ht = 0.0   # head not driven by sticks; use X-button presets
 
     # ─ Gripper (A=close, B=open) ─────────────────────────────────────
     grip_dir = (1 if gp.btn["B"] else 0) - (1 if gp.btn["A"] else 0)
@@ -566,14 +570,16 @@ def main():
     frame_i = 0
     last_print = time.time()
 
-    # Daemon-style: D-pad function toggles between wrist (default) and head
-    dpad_to_wrist = True
+    # Head pose toggle state (X button cycles between these two)
+    head_pose_state = "ahead"        # 'ahead' or 'tool'
+    head_lock_until = 0.0             # while time.time() < this, skip head set_velocity
 
     print("READY.  Type 's' (start recording) or use gamepad to teleop.")
     print("    button cheat-sheet:")
-    print("      A=close-grip   B=open-grip   X=toggle dpad(wrist↔head)")
+    print("      A=close-grip   B=open-grip   X=head pose (ahead↔tool)")
     print("      Y=save success   BACK=info   START=quit")
     print("      LB/RB=wrist_yaw   L2=precision   R2=fast-base")
+    print("      D-pad=wrist pitch/roll   LB+RB=toggle recording")
     print()
 
     try:
@@ -584,10 +590,11 @@ def main():
             state = motor.read_state()
 
             # 2) Read gamepad → per-joint velocities
-            vels = map_gamepad(gp, state, dpad_to_wrist)
+            vels = map_gamepad(gp, state)
 
-            # 3) Send to motors
-            motor.send_velocities(vels)
+            # 3) Send to motors (skip head set_velocity during pose move)
+            skip_head = time.time() < head_lock_until
+            motor.send_velocities(vels, skip_head=skip_head)
 
             # 4) Read cameras (always; cheap if no record)
             head_rgb, head_depth, ee_rgb, ee_depth = cams.read()
@@ -667,10 +674,12 @@ def main():
                 console.q.put("save")
             if gp.edge_pressed("BACK"):        # diagnostic dump
                 console.q.put("info")
-            if gp.edge_pressed("X"):           # toggle D-pad function
-                dpad_to_wrist = not dpad_to_wrist
-                tag = "wrist (pitch+roll)" if dpad_to_wrist else "head (pan+tilt)"
-                print(f"\n[mode] D-pad → {tag}\n")
+            if gp.edge_pressed("X"):           # toggle head pose preset
+                head_pose_state = "tool" if head_pose_state == "ahead" else "ahead"
+                eta = motor.head_pose(head_pose_state)
+                head_lock_until = time.time() + eta
+                tag = "tool (look at gripper)" if head_pose_state == "tool" else "ahead (forward)"
+                print(f"\n[head] → {tag}\n")
             # Combo: LB+RB held simultaneously → toggle recording
             if (gp.btn["LB"] and gp.btn["RB"]
                 and (gp.edge_pressed("LB") or gp.edge_pressed("RB"))):
