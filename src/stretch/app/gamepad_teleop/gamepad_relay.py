@@ -66,21 +66,45 @@ class XboxState:
     @staticmethod
     def _auto_detect():
         devs = [evdev.InputDevice(p) for p in evdev.list_devices()]
-        keywords = ("xbox", "gamepad", "controller", "joystick",
-                    "playstation", "ds4", "dualshock", "dualsense", "8bitdo")
-        prio = [d for d in devs if any(k in d.name.lower() for k in keywords)]
+        # Print all devices for diagnostic visibility
+        print("[relay] all evdev devices:")
+        for d in devs:
+            has_abs = evdev.ecodes.EV_ABS in d.capabilities()
+            print(f"  {d.path}  {d.name!r}  has_ABS={has_abs}")
+
+        keywords = ("xbox", "x-box", "gamepad", "controller", "joystick",
+                    "playstation", "ds4", "dualshock", "dualsense",
+                    "8bitdo", "stadia", " pad")  # leading space to avoid 'touchpad'
+        # Only exclude things that ALSO have ABS_X but aren't gamepads.
+        # Don't exclude substrings that could appear in vendor names (e.g.
+        # 'mic' is inside 'microsoft', 'mouse' is fine but mice don't have ABS_X anyway).
+        excludes = ("touchscreen", "touchpad", "passthrough", "trackpad")
+
+        # First pass: keyword in name + not excluded
+        prio = [
+            d for d in devs
+            if any(k in d.name.lower() for k in keywords)
+            and not any(x in d.name.lower() for x in excludes)
+        ]
+
+        # Second pass: any non-excluded ABS_X device
         if not prio:
             prio = [
                 d for d in devs
                 if evdev.ecodes.EV_ABS in d.capabilities()
                 and any(c == evdev.ecodes.ABS_X for c, _ in
                         d.capabilities()[evdev.ecodes.EV_ABS])
+                and not any(x in d.name.lower() for x in excludes)
             ]
+
         if not prio:
             avail = "\n  ".join(f"{d.path}: {d.name}" for d in devs) or "(none)"
             raise RuntimeError(
                 "No gamepad detected. Available evdev devices:\n  " + avail)
-        return prio[0]
+
+        chosen = prio[0]
+        print(f"[relay] >>> selected gamepad: {chosen.name!r} ({chosen.path})")
+        return chosen
 
     def _norm(self, code, raw):
         info = self._abs_info.get(code)

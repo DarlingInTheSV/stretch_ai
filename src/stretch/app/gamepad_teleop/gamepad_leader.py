@@ -147,17 +147,22 @@ class XboxController:
     @staticmethod
     def _auto_detect():
         devs = [evdev.InputDevice(p) for p in evdev.list_devices()]
-        # Prefer pads by name keyword
-        keywords = ("xbox", "gamepad", "controller", "joystick",
-                    "playstation", "ds4", "dualshock", "dualsense", "8bitdo")
-        prio = [d for d in devs if any(k in d.name.lower() for k in keywords)]
-        # Fallback: any evdev device with ABS_X axis
+        keywords = ("xbox", "x-box", "gamepad", "controller", "joystick",
+                    "playstation", "ds4", "dualshock", "dualsense",
+                    "8bitdo", "stadia", " pad")
+        excludes = ("touchscreen", "touchpad", "passthrough", "trackpad")
+        prio = [
+            d for d in devs
+            if any(k in d.name.lower() for k in keywords)
+            and not any(x in d.name.lower() for x in excludes)
+        ]
         if not prio:
             prio = [
                 d for d in devs
                 if evdev.ecodes.EV_ABS in d.capabilities()
                 and any(c == evdev.ecodes.ABS_X for c, _ in
                         d.capabilities()[evdev.ecodes.EV_ABS])
+                and not any(x in d.name.lower() for x in excludes)
             ]
         if not prio:
             available = "\n  ".join(f"{d.path}: {d.name}" for d in devs) or "(none)"
