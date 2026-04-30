@@ -9,36 +9,30 @@ Reads dual RealSense cameras directly via pyrealsense2.
 The bridge container should NOT be running while this script is active —
 both want to hold the same /dev/hello-* hardware ports.
 
-Usage on robot:
-    # 1. stop bridge so hardware is free
-    docker stop stretch_bridge
-
-    # 2. run leader (foreground, real-time state print)
-    python3 /home/hello-robot/robot_leader.py \
-        --task pickup_cup --user lsy --env office \
-        --data_dir /home/hello-robot/stretch_data
+Gamepad mapping — modeled after stretch_gamepad_teleop daemon
+─────────────────────────────────────────────────────────────────
+  Left stick    X = base yaw       Y = base linear
+  Right stick   X = arm extend     Y = lift
+  LB / RB       wrist_yaw  (left = +, right = −)   ALWAYS
+  D-pad         wrist pitch + roll   (DEFAULT)
+                  ↕  toggle with X button  ↕
+                head pan + tilt
+  A button      close gripper  (hold)
+  B button      open  gripper  (hold)
+  L2 trigger    precision mode (velocities × 0.3 while held)
+  R2 trigger    fast-base mode (base × 1.5  while held)
+  X button      TOGGLE D-pad function (wrist ↔ head)
+  Y button      save SUCCESS  (record control)
+  BACK button   abandon current recording / print state
+  START button  quit
 
 Console commands (typed during run):
-    s, start    start a new recording episode
-    p, pause    stop recording but keep buffered (no save)
-    y, save     save current episode as SUCCESS
-    a, abandon  discard current episode buffer
-    i, info     print full state snapshot
-    q, quit     exit cleanly
-
-Gamepad mapping (Xbox layout, same as gamepad_leader.py):
-    Left stick  Y          base forward / backward
-    Left stick  X          base rotate (yaw)
-    Right stick X          arm extend / retract           (default)
-    Right stick Y          lift up / down                 (default)
-    LB hold + Right X/Y    wrist roll / pitch
-    RB hold + Right X/Y    head pan / tilt
-    D-pad  L/R             wrist yaw  (always)
-    L2 / R2                gripper close / open
-    A button               toggle recording
-    Y button               save SUCCESS
-    B button               abandon
-    START                  quit
+  s, start    start a new recording episode
+  p, pause    stop recording but keep buffered (no save)
+  y, save     save current episode as SUCCESS
+  a, abandon  discard current episode buffer
+  i, info     print full state snapshot
+  q, quit     exit cleanly
 """
 
 import argparse
@@ -76,9 +70,10 @@ from stretch.utils.data_tools.record import FileDataRecorder
 #                              CONSTANTS
 # ══════════════════════════════════════════════════════════════════════
 DEFAULT_FPS = 15
-# Gripper observed range is wider than nominal; widen to actual servo limits
-GRIPPER_CLOSED = -0.50
-GRIPPER_OPEN   =  0.60
+# Gripper full physical range (Dynamixel travel; observed -0.45 ... +1.5+)
+# Use wide limits + let the servo's HW limit clamp.
+GRIPPER_CLOSED = -0.60
+GRIPPER_OPEN   =  1.50
 
 # Joint limits (m or rad)
 LIFT_MIN, LIFT_MAX = 0.15, 1.10
@@ -406,40 +401,52 @@ class StretchController:
 
 # ══════════════════════════════════════════════════════════════════════
 #                  Gamepad → per-joint velocity mapping
+#                  (modeled after stretch_gamepad_teleop daemon)
 # ══════════════════════════════════════════════════════════════════════
-def map_gamepad(gp: XboxState, state: dict, dt: float) -> dict:
-    wrist_mode = bool(gp.btn["LB"])
-    head_mode  = bool(gp.btn["RB"])
+def map_gamepad(gp: XboxState, state: dict, dpad_to_wrist: bool) -> dict:
+    """
+    Args:
+        gp:               XboxState (current gamepad state)
+        state:            current robot joint readings
+        dpad_to_wrist:    True → D-pad controls wrist pitch+roll
+                          False → D-pad controls head pan+tilt
+    """
+    # Modifier scaling
+    precision  = gp.lt > 0.7      # L2 held → fine motion
+    fast_base  = gp.rt > 0.7      # R2 held → faster base
+    p_scale = 0.30 if precision else 1.0
+    base_boost = 1.5 if fast_base else 1.0
 
-    # Base (left stick: y=fwd, x=yaw)
-    v_fwd = deadzone(gp.left_y) * MAX_BASE_V
-    v_yaw = -deadzone(gp.left_x) * MAX_BASE_W
+    # ─ Base (left stick) ─────────────────────────────────────────────
+    v_fwd = deadzone(gp.left_y) * MAX_BASE_V * base_boost * p_scale
+    v_yaw = -deadzone(gp.left_x) * MAX_BASE_W * base_boost * p_scale
 
+    # ─ Arm + Lift (right stick) ──────────────────────────────────────
     rx = deadzone(gp.right_x)
     ry = deadzone(gp.right_y)
+    v_arm  = rx * MAX_ARM_V  * p_scale
+    v_lift = ry * MAX_LIFT_V * p_scale
 
-    v_lift = v_arm = 0.0
+    # ─ Wrist yaw (shoulder buttons) ──────────────────────────────────
+    # LB pressed = +1, RB pressed = -1 (matches daemon)
+    yaw_dir = (1 if gp.btn["LB"] else 0) - (1 if gp.btn["RB"] else 0)
+    v_wy = yaw_dir * MAX_WRIST_V * p_scale
+
+    # ─ D-pad: wrist pitch+roll OR head pan+tilt (toggleable) ─────────
     v_wp = v_wr = 0.0
     v_hp = v_ht = 0.0
-    if head_mode:
-        v_hp = -rx * MAX_HEAD_V
-        v_ht =  ry * MAX_HEAD_V
-    elif wrist_mode:
-        v_wr = rx * MAX_WRIST_V
-        v_wp = ry * MAX_WRIST_V
+    if dpad_to_wrist:
+        v_wp = gp.dpad_y * MAX_WRIST_V * p_scale          # up=+pitch
+        v_wr = gp.dpad_x * MAX_WRIST_V * p_scale          # right=+roll
     else:
-        v_arm  = rx * MAX_ARM_V
-        v_lift = ry * MAX_LIFT_V
+        v_hp = gp.dpad_x * MAX_HEAD_V * p_scale           # right=+pan
+        v_ht = gp.dpad_y * MAX_HEAD_V * p_scale           # up=+tilt
 
-    # D-pad: wrist yaw (always)
-    v_wy = -gp.dpad_x * MAX_WRIST_V * 0.7
+    # ─ Gripper (A=close, B=open) ─────────────────────────────────────
+    grip_dir = (1 if gp.btn["B"] else 0) - (1 if gp.btn["A"] else 0)
+    v_grip = grip_dir * MAX_GRIPPER_V * p_scale
 
-    # Triggers: gripper
-    rt = max(0.0, gp.rt - TRIGGER_DEADZONE)
-    lt = max(0.0, gp.lt - TRIGGER_DEADZONE)
-    v_grip = (rt - lt) * MAX_GRIPPER_V
-
-    # Soft joint-limit check: zero-out velocity if pushing past limits
+    # ─ Soft joint-limit clamps ───────────────────────────────────────
     def softlimit(cur, lo, hi, v):
         if v > 0 and cur >= hi: return 0.0
         if v < 0 and cur <= lo: return 0.0
@@ -546,7 +553,14 @@ def main():
     frame_i = 0
     last_print = time.time()
 
-    print("READY. Press A on gamepad or type 'start' to begin.")
+    # Daemon-style: D-pad function toggles between wrist (default) and head
+    dpad_to_wrist = True
+
+    print("READY.  Type 's' (start recording) or use gamepad to teleop.")
+    print("    button cheat-sheet:")
+    print("      A=close-grip   B=open-grip   X=toggle dpad(wrist↔head)")
+    print("      Y=save success   BACK=info   START=quit")
+    print("      LB/RB=wrist_yaw   L2=precision   R2=fast-base")
     print()
 
     try:
@@ -557,7 +571,7 @@ def main():
             state = motor.read_state()
 
             # 2) Read gamepad → per-joint velocities
-            vels = map_gamepad(gp, state, dt)
+            vels = map_gamepad(gp, state, dpad_to_wrist)
 
             # 3) Send to motors
             motor.send_velocities(vels)
@@ -613,34 +627,41 @@ def main():
                 _zh = np.zeros((CAM_RGB_H,   CAM_RGB_W,   3), dtype=np.uint8)
                 _zd = np.zeros((CAM_DEPTH_H, CAM_DEPTH_W),    dtype=np.uint16)
                 try:
+                    # FileDataRecorder.add() signature on this robot:
+                    # (ee_rgb, ee_depth, xyz, quaternion, gripper,
+                    #  ee_pos, ee_rot, observations, actions,
+                    #  head_rgb=None, head_depth=None)
                     recorder.add(
-                        ee_rgb        = ee_rgb        if ee_rgb        is not None else _zh,
-                        ee_depth      = ee_depth      if ee_depth      is not None else _zd,
-                        ee_cam_pose   = np.eye(4),         # FK to compute later in ETL
-                        xyz           = np.zeros(3),       # AR-marker N/A for gamepad
-                        quaternion    = np.array([0,0,0,1]),
-                        gripper       = float(state["gripper"]),
-                        ee_pose       = np.eye(4),
-                        observations  = obs_dict,
-                        actions       = tgt,
-                        head_rgb      = head_rgb      if head_rgb      is not None else _zh,
-                        head_depth    = head_depth    if head_depth    is not None else _zd,
-                        head_cam_pose = np.eye(4),
+                        ee_rgb       = ee_rgb       if ee_rgb       is not None else _zh,
+                        ee_depth     = ee_depth     if ee_depth     is not None else _zd,
+                        xyz          = np.zeros(3, dtype=np.float32),     # AR-marker N/A
+                        quaternion   = np.array([0,0,0,1], dtype=np.float32),
+                        gripper      = float(state["gripper"]),
+                        ee_pos       = np.zeros(3, dtype=np.float32),     # FK at ETL time
+                        ee_rot       = np.eye(3, dtype=np.float32),
+                        observations = obs_dict,
+                        actions      = tgt,
+                        head_rgb     = head_rgb     if head_rgb     is not None else _zh,
+                        head_depth   = head_depth   if head_depth   is not None else _zd,
                     )
                 except Exception as e:
                     print(f"[REC ] add() failed: {e}")
 
-            # 7) Handle gamepad button events
+            # 7) Handle gamepad button events (A/B reserved for gripper)
             if gp.edge_pressed("START"):
                 console.q.put("quit")
-            if gp.edge_pressed("A"):
-                console.q.put("start" if not recording else "pause")
-            if gp.edge_pressed("Y"):
+            if gp.edge_pressed("Y"):           # save SUCCESS (recording only)
                 console.q.put("save")
-            if gp.edge_pressed("B"):
-                console.q.put("abandon")
-            if gp.edge_pressed("BACK"):
+            if gp.edge_pressed("BACK"):        # diagnostic dump
                 console.q.put("info")
+            if gp.edge_pressed("X"):           # toggle D-pad function
+                dpad_to_wrist = not dpad_to_wrist
+                tag = "wrist (pitch+roll)" if dpad_to_wrist else "head (pan+tilt)"
+                print(f"\n[mode] D-pad → {tag}\n")
+            # Combo: LB+RB held simultaneously → toggle recording
+            if (gp.btn["LB"] and gp.btn["RB"]
+                and (gp.edge_pressed("LB") or gp.edge_pressed("RB"))):
+                console.q.put("pause" if recording else "start")
 
             # 8) Handle console commands
             cmd = console.get_nowait()
