@@ -73,12 +73,57 @@ def move_to_start_pose(robot, action):
     time.sleep(3.0)  # let trapezoidal motion settle
 
 
+def _read_live_state(robot):
+    """Snapshot current state from stretch_body (matching what was recorded)."""
+    eoa = robot.end_of_arm.motors
+    h   = robot.head.motors
+    b   = robot.base.status
+    return {
+        "base_x":      b["x"],
+        "base_y":      b["y"],
+        "base_theta":  b["theta"],
+        "lift":        robot.lift.status["pos"],
+        "arm":         robot.arm.status["pos"],
+        "wrist_yaw":   eoa["wrist_yaw"].status["pos"],
+        "wrist_pitch": eoa["wrist_pitch"].status["pos"],
+        "wrist_roll":  eoa["wrist_roll"].status["pos"],
+        "gripper":     eoa["stretch_gripper"].status["pos"],
+        "head_pan":    h["head_pan"].status["pos"],
+        "head_tilt":   h["head_tilt"].status["pos"],
+    }
+
+
+def _wrap_pi(a):
+    return (a + math.pi) % (2 * math.pi) - math.pi
+
+
+def _diff_state(saved, live):
+    """Return per-field abs error.  base_theta wraps to ±π."""
+    diffs = {}
+    for k in saved:
+        if k not in live:
+            continue
+        if k == "base_theta":
+            diffs[k] = abs(_wrap_pi(saved[k] - live[k]))
+        else:
+            diffs[k] = abs(saved[k] - live[k])
+    return diffs
+
+
 def replay_velocity(robot, frames, fps):
-    """Replay using each frame's recorded raw velocities (v_*)."""
+    """Replay using each frame's recorded raw velocities (v_*).
+
+    Also samples the LIVE state each frame and compares to the recorded
+    obs at the same step — useful for measuring how faithfully the
+    replay reproduces the original trajectory.
+    """
     dt = 1.0 / fps
     next_t = time.time()
+    divergence_log = []     # list of dicts {field: abs_err}
+
     for i, fr in enumerate(frames):
         a = fr["actions"]
+        s_saved = fr["observations"]
         # Hello-Motor lift / arm
         robot.lift.set_velocity(a.get("v_lift", 0.0), a_m=ACC_LIFT)
         robot.arm.set_velocity (a.get("v_arm",  0.0), a_m=ACC_ARM)
@@ -102,14 +147,22 @@ def replay_velocity(robot, frames, fps):
 
         robot.push_command()
 
-        # 1Hz progress print
+        # Sample LIVE state for divergence check
+        try:
+            s_live = _read_live_state(robot)
+            divergence_log.append(_diff_state(s_saved, s_live))
+        except Exception:
+            pass
+
+        # 1Hz progress print w/ divergence
         if i % fps == 0:
             t = i * dt
-            s = fr["observations"]
+            d = divergence_log[-1] if divergence_log else {}
             print(f"  [{t:6.1f}s] frame {i:5d}/{len(frames)}  "
-                  f"lift={s['lift']:.2f} arm={s['arm']:.2f} "
-                  f"head=({s['head_pan']:+.2f},{s['head_tilt']:+.2f}) "
-                  f"grip={s['gripper']:5.2f}")
+                  f"lift={s_saved['lift']:.2f}(Δ{d.get('lift',0):.3f}) "
+                  f"arm={s_saved['arm']:.2f}(Δ{d.get('arm',0):.3f}) "
+                  f"base=({s_saved['base_x']:+.2f},{s_saved['base_y']:+.2f},{s_saved['base_theta']:+.2f}) "
+                  f"Δbase=({d.get('base_x',0):.3f},{d.get('base_y',0):.3f},{d.get('base_theta',0):.3f})")
 
         next_t += dt
         slack = next_t - time.time()
@@ -117,14 +170,18 @@ def replay_velocity(robot, frames, fps):
             time.sleep(slack)
         else:
             next_t = time.time()
+    return divergence_log
 
 
 def replay_target(robot, frames, fps):
     """Replay using each frame's recorded absolute targets (joint_*)."""
     dt = 1.0 / fps
     next_t = time.time()
+    divergence_log = []
+
     for i, fr in enumerate(frames):
         a = fr["actions"]
+        s_saved = fr["observations"]
         # Arm chain — absolute position targets
         robot.lift.move_to(a["joint_lift"])
         robot.arm.move_to (a["joint_arm_l0"])
@@ -147,13 +204,20 @@ def replay_target(robot, frames, fps):
 
         robot.push_command()
 
+        try:
+            s_live = _read_live_state(robot)
+            divergence_log.append(_diff_state(s_saved, s_live))
+        except Exception:
+            pass
+
         if i % fps == 0:
             t = i * dt
-            s = fr["observations"]
+            d = divergence_log[-1] if divergence_log else {}
             print(f"  [{t:6.1f}s] frame {i:5d}/{len(frames)}  "
-                  f"lift={s['lift']:.2f} arm={s['arm']:.2f} "
-                  f"head=({s['head_pan']:+.2f},{s['head_tilt']:+.2f}) "
-                  f"grip={s['gripper']:5.2f}")
+                  f"lift={s_saved['lift']:.2f}(Δ{d.get('lift',0):.3f}) "
+                  f"arm={s_saved['arm']:.2f}(Δ{d.get('arm',0):.3f}) "
+                  f"base=({s_saved['base_x']:+.2f},{s_saved['base_y']:+.2f},{s_saved['base_theta']:+.2f}) "
+                  f"Δbase=({d.get('base_x',0):.3f},{d.get('base_y',0):.3f},{d.get('base_theta',0):.3f})")
 
         next_t += dt
         slack = next_t - time.time()
@@ -161,6 +225,40 @@ def replay_target(robot, frames, fps):
             time.sleep(slack)
         else:
             next_t = time.time()
+    return divergence_log
+
+
+def _print_divergence_report(divergence_log):
+    """Aggregate per-field statistics from per-frame divergences."""
+    if not divergence_log:
+        print("[stats] no divergence samples collected")
+        return
+
+    fields = sorted(divergence_log[0].keys())
+    n = len(divergence_log)
+
+    print("\n" + "=" * 72)
+    print("STATE DIVERGENCE: |saved − live| per field")
+    print("=" * 72)
+    print(f"  {'field':18s}  {'mean':>10s}  {'median':>10s}  {'p95':>10s}  {'max':>10s}")
+    print(f"  {'-'*18}  {'-'*10}  {'-'*10}  {'-'*10}  {'-'*10}")
+    import statistics as st
+    for f in fields:
+        vals = [d[f] for d in divergence_log if f in d]
+        if not vals:
+            continue
+        vals_sorted = sorted(vals)
+        mean = sum(vals) / len(vals)
+        med = vals_sorted[len(vals_sorted) // 2]
+        p95 = vals_sorted[int(0.95 * len(vals_sorted))]
+        mx = vals_sorted[-1]
+        unit = "rad" if f in ("base_theta","wrist_yaw","wrist_pitch","wrist_roll",
+                              "head_pan","head_tilt") else \
+               "m"   if f in ("base_x","base_y","lift","arm") else ""
+        print(f"  {f:18s}  {mean:10.4f}  {med:10.4f}  {p95:10.4f}  {mx:10.4f}  {unit}")
+    print("=" * 72)
+    print(f"  {n} samples over {n / 15:.1f}s ({len(fields)} fields)")
+    print()
 
 
 def main():
@@ -230,10 +328,11 @@ def main():
 
         print(f"\nreplaying ...")
         if args.mode == "velocity":
-            replay_velocity(robot, frames, args.fps)
+            divergence = replay_velocity(robot, frames, args.fps)
         else:
-            replay_target(robot, frames, args.fps)
+            divergence = replay_target(robot, frames, args.fps)
         print("\n[done] replay complete.")
+        _print_divergence_report(divergence)
     except KeyboardInterrupt:
         print("\n[!] interrupted by user")
     finally:
