@@ -265,10 +265,17 @@ class DualRealsense:
         self.head_pipe = self._make_pipeline(self.head_serial) if self.head_serial else None
         self.ee_pipe   = self._make_pipeline(self.ee_serial)   if self.ee_serial   else None
 
-        # Warm up: drop first few frames to stabilize exposure
-        for _ in range(5):
+        # Cache of last-good frame per camera; consumers always get
+        # a non-None RGB/depth (stale-but-valid > black).
+        self._last_head_color = None
+        self._last_head_depth = None
+        self._last_ee_color   = None
+        self._last_ee_depth   = None
+
+        # Warm up: prime the cache with first few frames
+        for _ in range(20):
             self.read()
-            time.sleep(0.05)
+            time.sleep(0.03)
 
     @staticmethod
     def _make_pipeline(serial):
@@ -285,10 +292,15 @@ class DualRealsense:
         return pipe
 
     def _grab(self, pipe):
+        """Return (color, depth) if a fresh frame is ready, else (None, None).
+
+        Uses poll_for_frames (non-blocking) so we don't stall the control loop.
+        """
         if pipe is None:
             return None, None
         try:
             frames = pipe.poll_for_frames()
+            # poll_for_frames returns a composite_frame; truthy iff frames present
             if not frames:
                 return None, None
             cf = frames.get_color_frame()
@@ -302,9 +314,22 @@ class DualRealsense:
             return None, None
 
     def read(self):
-        head_color, head_depth = self._grab(self.head_pipe)
-        ee_color,   ee_depth   = self._grab(self.ee_pipe)
-        return head_color, head_depth, ee_color, ee_depth
+        """Return latest (head_rgb, head_depth, ee_rgb, ee_depth).
+
+        If a camera doesn't have a fresh frame this cycle, returns the
+        cached last-good frame instead of None. This prevents black frames
+        in the recording when the camera and control loop fall out of phase.
+        """
+        hc, hd = self._grab(self.head_pipe)
+        if hc is not None:
+            self._last_head_color = hc
+            self._last_head_depth = hd
+        ec, ed = self._grab(self.ee_pipe)
+        if ec is not None:
+            self._last_ee_color = ec
+            self._last_ee_depth = ed
+        return (self._last_head_color, self._last_head_depth,
+                self._last_ee_color,   self._last_ee_depth)
 
     def stop(self):
         for p in (self.head_pipe, self.ee_pipe):
@@ -702,6 +727,11 @@ def main():
                         n = recorder.step
                         recording = False
                         recorder.write(success=True)
+                        # Find the just-written episode dir and stitch a
+                        # head+gripper side-by-side video.
+                        ep_dir = _latest_episode_dir(recorder.task_dir)
+                        if ep_dir is not None:
+                            _make_stitched_video(ep_dir)
                         print(f"\n[REC ] ✓ saved SUCCESS  ({n} frames)\n")
                     else:
                         print("[REC ] (save) no frames buffered")
@@ -750,6 +780,53 @@ def main():
         try: motor.shutdown()
         except: pass
         print("[exit] done.")
+
+
+def _latest_episode_dir(task_dir):
+    """Return the most recently created subdir under task_dir."""
+    try:
+        subs = [p for p in task_dir.iterdir() if p.is_dir()]
+        if not subs:
+            return None
+        return max(subs, key=lambda p: p.stat().st_mtime)
+    except Exception as e:
+        print(f"[stitch] cannot find episode dir: {e}")
+        return None
+
+
+def _make_stitched_video(episode_dir):
+    """Run ffmpeg to combine head + gripper videos side-by-side.
+
+    Produces <episode_dir>/stitched_head_ee.mp4   (h264, head | gripper).
+    """
+    import subprocess
+    head_mp4    = episode_dir / "head_compressed_video_h264.mp4"
+    gripper_mp4 = episode_dir / "gripper_compressed_video_h264.mp4"
+    out_mp4     = episode_dir / "stitched_head_ee.mp4"
+    if not head_mp4.exists() or not gripper_mp4.exists():
+        print(f"[stitch] missing input videos in {episode_dir}")
+        return
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(head_mp4),
+        "-i", str(gripper_mp4),
+        "-filter_complex",
+        # pad both to same height, then horizontally stack
+        "[0:v][1:v]hstack=inputs=2[v]",
+        "-map", "[v]",
+        "-c:v", "libx264", "-crf", "28",
+        "-loglevel", "error",
+        str(out_mp4),
+    ]
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=60)
+        if r.returncode == 0:
+            print(f"[stitch] ✓ {out_mp4.name}")
+        else:
+            print(f"[stitch] ffmpeg failed (rc={r.returncode}): "
+                  f"{r.stderr.decode()[:200]}")
+    except Exception as e:
+        print(f"[stitch] error: {e}")
 
 
 def _print_full(state, vels, tgt, recording, n_frames):
