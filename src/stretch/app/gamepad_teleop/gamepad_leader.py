@@ -82,13 +82,13 @@ GRIPPER_CLOSED = -0.30
 GRIPPER_OPEN   =  0.60
 
 # ── Velocity scaling at full stick deflection ─────────────────────────
-MAX_BASE_V    = 0.20    # m/s   forward
-MAX_BASE_W    = 0.60    # rad/s yaw
-MAX_LIFT_V    = 0.10    # m/s
-MAX_ARM_V     = 0.10    # m/s
-MAX_WRIST_V   = 1.00    # rad/s
-MAX_HEAD_V    = 1.00    # rad/s
-MAX_GRIPPER_V = 1.50    # gripper-units/s ([-0.3,0.6] range)
+MAX_BASE_V    = 0.30    # m/s   forward
+MAX_BASE_W    = 0.80    # rad/s yaw
+MAX_LIFT_V    = 0.20    # m/s   (was 0.10, felt sluggish)
+MAX_ARM_V     = 0.15    # m/s   (was 0.10)
+MAX_WRIST_V   = 1.50    # rad/s
+MAX_HEAD_V    = 1.50    # rad/s
+MAX_GRIPPER_V = 3.00    # gripper-units/s ([-0.3,0.6] range, was 1.5 too slow)
 
 STICK_DEADZONE   = 0.10
 TRIGGER_DEADZONE = 0.05
@@ -483,6 +483,8 @@ class GamepadLeader:
     # ── Sending to robot ──────────────────────────────────────────────
     def send(self, targets):
         # Arm + wrist + gripper + head via arm_to (manipulation mode)
+        # arm_to internally builds {"joint": [...], "gripper": ..., "head_to": ...}
+        # which matches the bridge's `elif "joint" in action` branch.
         joint_angles = np.array([
             0.0,                                   # base_x_joint unused
             targets["joint_lift"],
@@ -504,8 +506,15 @@ class GamepadLeader:
         except Exception as e:
             print(f"[Leader] arm_to failed: {e}")
 
-        # Base velocity (works in either mode in stretch_ros2_bridge)
-        self.robot.set_velocity(targets["base_v_forward"], targets["base_v_yaw"])
+        # Base velocity — must use set_base_velocity (NOT set_velocity).
+        # set_base_velocity sends {"base_velocity": {"v":..., "w":...}}, the
+        # only key the bridge action handler actually matches.
+        try:
+            self.robot.set_base_velocity(
+                targets["base_v_forward"], targets["base_v_yaw"]
+            )
+        except Exception as e:
+            print(f"[Leader] set_base_velocity failed: {e}")
 
     # ── Recording ─────────────────────────────────────────────────────
     def record_frame(self, state, targets):

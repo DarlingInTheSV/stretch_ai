@@ -70,10 +70,11 @@ from stretch.utils.data_tools.record import FileDataRecorder
 #                              CONSTANTS
 # ══════════════════════════════════════════════════════════════════════
 DEFAULT_FPS = 15
-# Gripper full physical range (Dynamixel travel; observed -0.45 ... +1.5+)
-# Use wide limits + let the servo's HW limit clamp.
-GRIPPER_CLOSED = -0.60
-GRIPPER_OPEN   =  1.50
+# Gripper position scale is in custom units, NOT [-0.3, 0.6].
+# Empirically: 0 = closed, ~9 = comfortably open, up to ~70 fully open.
+# Use wide soft-limits and let the Dynamixel HW limit clamp.
+GRIPPER_CLOSED = -2.0
+GRIPPER_OPEN   = 80.0
 
 # Joint limits (m or rad)
 LIFT_MIN, LIFT_MAX = 0.15, 1.10
@@ -91,7 +92,8 @@ MAX_LIFT_V    = 0.20   # m/s
 MAX_ARM_V     = 0.15   # m/s
 MAX_WRIST_V   = 1.50   # rad/s
 MAX_HEAD_V    = 1.50   # rad/s
-MAX_GRIPPER_V = 3.00   # gripper-units/s
+MAX_GRIPPER_V = 3.00   # gripper-units/s (used only as on/off direction)
+GRIPPER_MOVE_BY_PCT = 60.0   # daemon's gripper_rotate_pct: move target by this each call
 
 # Acceleration (m/s² or rad/s²) — fed to stretch_body set_velocity
 ACC_LIFT     = 0.20
@@ -330,7 +332,13 @@ class StretchController:
             raise RuntimeError(
                 "Robot is NOT calibrated/homed.  Run stretch_robot_home.py first.")
         self.has_dexwrist = True  # SE3 has dex wrist by default
-        print("[motor] stretch_body OK")
+
+        # Cache gripper motion params (max vel + accel from robot params)
+        gp_params = self.robot.end_of_arm.motors["stretch_gripper"].params
+        self._gripper_max_vel = gp_params["motion"]["max"]["vel"]
+        self._gripper_max_acc = gp_params["motion"]["max"]["accel"]
+        print(f"[motor] stretch_body OK; gripper vel={self._gripper_max_vel} "
+              f"acc={self._gripper_max_acc}")
 
     # ─ State read ─────────────────────────────────────────────────────
     def read_state(self):
@@ -361,31 +369,36 @@ class StretchController:
     def send_velocities(self, v):
         """Send all per-joint velocities, then push_command once.
 
-        Verified API signatures:
-          lift.set_velocity(v_m,  a_m=None, ...)
-          arm.set_velocity (v_m,  a_m=None, ...)
-          base.set_velocity(v_m, w_r, a=None, ...)         ← combined v+w
-          end_of_arm.set_velocity(joint, v_r, a_r=None)    ← 'a_r' not 'a'
-          head.set_velocity(joint, v_r, a_r=None)          ← 'a_r' not 'a'
+        Gripper uses move_by() like the daemon (set_velocity gets clamped
+        early by Dynamixel internal target-update behavior).
         """
-        # Hello-Motor lift / arm  (need push_command)
+        # Hello-Motor lift / arm
         self.robot.lift.set_velocity(v.get("lift", 0.0), a_m=ACC_LIFT)
         self.robot.arm.set_velocity (v.get("arm",  0.0), a_m=ACC_ARM)
 
-        # Base — combined v+w in one call
+        # Base — combined v+w
         self.robot.base.set_velocity(v.get("base_v", 0.0),
                                      v.get("base_w", 0.0))
 
-        # Dynamixel chain — UART direct, no push_command needed for these
+        # Dynamixel chain — set_velocity for wrist + head
         for j in ("wrist_yaw", "wrist_pitch", "wrist_roll"):
             self.robot.end_of_arm.set_velocity(j, v.get(j, 0.0), a_r=ACC_WRIST)
-        self.robot.end_of_arm.set_velocity("stretch_gripper",
-                                           v.get("gripper", 0.0),
-                                           a_r=ACC_GRIPPER)
         for j in ("head_pan", "head_tilt"):
             self.robot.head.set_velocity(j, v.get(j, 0.0), a_r=ACC_HEAD)
 
-        # Flush queued Hello-Motor commands (lift/arm/base)
+        # Gripper: daemon-style move_by (60 per call, max vel/accel)
+        gv = v.get("gripper", 0.0)
+        if gv != 0.0:
+            grip = self.robot.end_of_arm.get_joint("stretch_gripper")
+            pct = math.copysign(GRIPPER_MOVE_BY_PCT, gv)
+            try:
+                grip.move_by(pct,
+                             self._gripper_max_vel,
+                             self._gripper_max_acc)
+            except Exception as e:
+                print(f"[motor] gripper move_by failed: {e}")
+
+        # Flush queued Hello-Motor commands (lift/arm/base only)
         self.robot.push_command()
 
     def stop_all(self):
