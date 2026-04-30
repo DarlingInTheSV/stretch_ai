@@ -518,14 +518,16 @@ class StretchController:
     def stop_all(self):
         self.send_velocities({})
 
-    # Custom head poses (override stretch_body defaults)
-    #   'ahead' has tilt=-0.4 (~-23°) so the floor is visible while
-    #     driving / approaching objects.  stretch_body default is (0,0)
-    #     which only sees walls.
-    #   'tool'  matches stretch_body default — looks at the gripper.
+    # Head poses aligned with stretch_ai conventions
+    # (see src/stretch/motion/constants.py STRETCH_NAVIGATION_Q /
+    #  STRETCH_PREGRASP_Q):
+    #   'ahead' = navigation pose: pan=0, tilt=-65° -- see floor + things in
+    #            front while driving (also matches ai_pickup's nav posture).
+    #   'tool'  = pregrasp pose:   pan=-90°, tilt=-45° -- look at gripper for
+    #            manipulation (matches ai_pickup PREGRASP).
     _HEAD_POSES = {
-        "ahead": (0.0, -0.40),                # (pan, tilt) rad
-        "tool":  (-math.pi / 2, -math.pi / 4),  # -90, -45 deg
+        "ahead": (0.0,             math.radians(-65)),   # 0, -65°  navigation
+        "tool":  (-math.pi / 2,    -math.pi / 4),         # -90, -45° manipulation
     }
 
     def head_pose(self, name: str):
