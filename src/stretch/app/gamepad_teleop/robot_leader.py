@@ -368,9 +368,13 @@ class StretchController:
         self.robot.lift.set_velocity(v.get("lift", 0.0), a_m=ACC_LIFT)
         self.robot.arm.set_velocity (v.get("arm",  0.0), a_m=ACC_ARM)
 
-        # Base (also Hello-Motor)
-        self.robot.base.set_translate_velocity(v.get("base_v", 0.0))
-        self.robot.base.set_rotate_velocity   (v.get("base_w", 0.0))
+        # Base (Hello-Motor wheels) — API is asymmetric:
+        #   set_translate_velocity(v)      ← linear, NOT 'translational'
+        #   set_rotational_velocity(w)     ← angular, NOT 'rotate'
+        bv = v.get("base_v", 0.0)
+        bw = v.get("base_w", 0.0)
+        self.robot.base.set_translate_velocity(bv)
+        self.robot.base.set_rotational_velocity(bw)
 
         # Dynamixel chain — set_velocity dispatches over UART directly
         for j in ("wrist_yaw", "wrist_pitch", "wrist_roll"):
