@@ -249,6 +249,23 @@ class XboxState:
 # ══════════════════════════════════════════════════════════════════════
 class DualRealsense:
     def __init__(self):
+        # First: hardware_reset every camera to recover from any prior
+        # frozen-pipe state (RealSense USB drivers occasionally lock up
+        # if the previous owner didn't shut down cleanly).
+        ctx = rs.context()
+        for d in ctx.devices:
+            try:
+                print(f"[cam ] hardware_reset {d.get_info(rs.camera_info.name)} "
+                      f"sn={d.get_info(rs.camera_info.serial_number)}")
+                d.hardware_reset()
+            except Exception as e:
+                print(f"[cam ] reset failed: {e}")
+
+        # Wait for cameras to re-enumerate after reset
+        print("[cam ] waiting 5s for cameras to come back ...")
+        time.sleep(5.0)
+
+        # Re-enumerate
         ctx = rs.context()
         self.head_serial = None
         self.ee_serial   = None
@@ -276,8 +293,34 @@ class DualRealsense:
         self._last_ee_color   = None
         self._last_ee_depth   = None
 
-        # Warm up: prime the cache with first few frames
-        for _ in range(20):
+        # Prime cache by blocking-wait for first frame from each camera.
+        # poll_for_frames() may return empty for many seconds after
+        # pipeline.start(), so we must wait_for_frames here at least once
+        # to guarantee the cache is populated before the main loop begins.
+        for label, pipe in (("head", self.head_pipe), ("ee", self.ee_pipe)):
+            if pipe is None:
+                continue
+            try:
+                f = pipe.wait_for_frames(5000)
+                cf = f.get_color_frame()
+                df = f.get_depth_frame()
+                if cf and df:
+                    color = np.asanyarray(cf.get_data()).copy()
+                    depth = np.asanyarray(df.get_data()).copy()
+                    if label == "head":
+                        self._last_head_color, self._last_head_depth = color, depth
+                    else:
+                        self._last_ee_color, self._last_ee_depth = color, depth
+                    print(f"[cam ] {label} primed: shape={color.shape} "
+                          f"mean={color.mean():.0f}")
+                else:
+                    print(f"[cam ] {label} got composite but no color/depth frame")
+            except Exception as e:
+                print(f"[cam ] {label} wait_for_frames failed: {e}")
+
+        # Brief poll-based warm-up after first frame, so subsequent polls
+        # in the main loop have hot-path coverage.
+        for _ in range(10):
             self.read()
             time.sleep(0.03)
 
