@@ -104,6 +104,10 @@ ACC_GRIPPER  = 4.0
 STICK_DEADZONE   = 0.10
 TRIGGER_DEADZONE = 0.05
 
+# 1×1 placeholder depth (used when --save_depth is off; avoids GB-scale
+# liblzfse compression that hangs the robot CPU for minutes).
+_DEPTH_STUB = np.zeros((1, 1), dtype=np.uint16)
+
 # Camera config
 CAM_RGB_W, CAM_RGB_H, CAM_RGB_FPS = 640, 480, 30
 CAM_DEPTH_W, CAM_DEPTH_H, CAM_DEPTH_FPS = 640, 480, 30
@@ -558,6 +562,10 @@ def main():
     ap.add_argument("--env",      default="default_env")
     ap.add_argument("--data_dir", default="/home/hello-robot/stretch_data")
     ap.add_argument("--fps",      type=int, default=DEFAULT_FPS)
+    ap.add_argument("--save_depth", action="store_true",
+                    help="store full-resolution depth (slow on long episodes; "
+                         "single-threaded liblzfse compression of GB-scale data "
+                         "can take minutes on the robot CPU). Default off.")
     args = ap.parse_args()
 
     dt = 1.0 / args.fps
@@ -669,25 +677,28 @@ def main():
                     "base_v_yaw":      state["v_yaw"],
                 }
                 # FileDataRecorder requires non-None images; substitute zeros if missing
-                _zh = np.zeros((CAM_RGB_H,   CAM_RGB_W,   3), dtype=np.uint8)
-                _zd = np.zeros((CAM_DEPTH_H, CAM_DEPTH_W),    dtype=np.uint16)
+                _zh = np.zeros((CAM_RGB_H, CAM_RGB_W, 3), dtype=np.uint8)
+                if args.save_depth:
+                    _zd = np.zeros((CAM_DEPTH_H, CAM_DEPTH_W), dtype=np.uint16)
+                    rec_ee_depth   = ee_depth   if ee_depth   is not None else _zd
+                    rec_head_depth = head_depth if head_depth is not None else _zd
+                else:
+                    # Tiny 1x1 placeholder — np.stack works, liblzfse is instant.
+                    rec_ee_depth   = _DEPTH_STUB
+                    rec_head_depth = _DEPTH_STUB
                 try:
-                    # FileDataRecorder.add() signature on this robot:
-                    # (ee_rgb, ee_depth, xyz, quaternion, gripper,
-                    #  ee_pos, ee_rot, observations, actions,
-                    #  head_rgb=None, head_depth=None)
                     recorder.add(
                         ee_rgb       = ee_rgb       if ee_rgb       is not None else _zh,
-                        ee_depth     = ee_depth     if ee_depth     is not None else _zd,
-                        xyz          = np.zeros(3, dtype=np.float32),     # AR-marker N/A
+                        ee_depth     = rec_ee_depth,
+                        xyz          = np.zeros(3, dtype=np.float32),
                         quaternion   = np.array([0,0,0,1], dtype=np.float32),
                         gripper      = float(state["gripper"]),
-                        ee_pos       = np.zeros(3, dtype=np.float32),     # FK at ETL time
+                        ee_pos       = np.zeros(3, dtype=np.float32),
                         ee_rot       = np.eye(3, dtype=np.float32),
                         observations = obs_dict,
                         actions      = tgt,
                         head_rgb     = head_rgb     if head_rgb     is not None else _zh,
-                        head_depth   = head_depth   if head_depth   is not None else _zd,
+                        head_depth   = rec_head_depth,
                     )
                 except Exception as e:
                     print(f"[REC ] add() failed: {e}")
