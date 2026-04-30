@@ -76,7 +76,8 @@ from stretch.utils.data_tools.record import FileDataRecorder
 #                              CONSTANTS
 # ══════════════════════════════════════════════════════════════════════
 DEFAULT_FPS = 15
-GRIPPER_CLOSED = -0.30
+# Gripper observed range is wider than nominal; widen to actual servo limits
+GRIPPER_CLOSED = -0.50
 GRIPPER_OPEN   =  0.60
 
 # Joint limits (m or rad)
@@ -363,29 +364,33 @@ class StretchController:
 
     # ─ Velocity command (per joint) ───────────────────────────────────
     def send_velocities(self, v):
-        """Send all per-joint velocities, then push_command once."""
-        # Hello-Motor lift / arm (need push_command)
+        """Send all per-joint velocities, then push_command once.
+
+        Verified API signatures:
+          lift.set_velocity(v_m,  a_m=None, ...)
+          arm.set_velocity (v_m,  a_m=None, ...)
+          base.set_velocity(v_m, w_r, a=None, ...)         ← combined v+w
+          end_of_arm.set_velocity(joint, v_r, a_r=None)    ← 'a_r' not 'a'
+          head.set_velocity(joint, v_r, a_r=None)          ← 'a_r' not 'a'
+        """
+        # Hello-Motor lift / arm  (need push_command)
         self.robot.lift.set_velocity(v.get("lift", 0.0), a_m=ACC_LIFT)
         self.robot.arm.set_velocity (v.get("arm",  0.0), a_m=ACC_ARM)
 
-        # Base (Hello-Motor wheels) — API is asymmetric:
-        #   set_translate_velocity(v)      ← linear, NOT 'translational'
-        #   set_rotational_velocity(w)     ← angular, NOT 'rotate'
-        bv = v.get("base_v", 0.0)
-        bw = v.get("base_w", 0.0)
-        self.robot.base.set_translate_velocity(bv)
-        self.robot.base.set_rotational_velocity(bw)
+        # Base — combined v+w in one call
+        self.robot.base.set_velocity(v.get("base_v", 0.0),
+                                     v.get("base_w", 0.0))
 
-        # Dynamixel chain — set_velocity dispatches over UART directly
+        # Dynamixel chain — UART direct, no push_command needed for these
         for j in ("wrist_yaw", "wrist_pitch", "wrist_roll"):
-            self.robot.end_of_arm.set_velocity(j, v.get(j, 0.0), a=ACC_WRIST)
+            self.robot.end_of_arm.set_velocity(j, v.get(j, 0.0), a_r=ACC_WRIST)
         self.robot.end_of_arm.set_velocity("stretch_gripper",
                                            v.get("gripper", 0.0),
-                                           a=ACC_GRIPPER)
+                                           a_r=ACC_GRIPPER)
         for j in ("head_pan", "head_tilt"):
-            self.robot.head.set_velocity(j, v.get(j, 0.0), a=ACC_HEAD)
+            self.robot.head.set_velocity(j, v.get(j, 0.0), a_r=ACC_HEAD)
 
-        # Flush queued Hello-Motor commands
+        # Flush queued Hello-Motor commands (lift/arm/base)
         self.robot.push_command()
 
     def stop_all(self):
