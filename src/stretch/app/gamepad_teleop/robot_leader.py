@@ -829,8 +829,9 @@ def main():
                 "v_wrist_pitch":      vels["wrist_pitch"],
                 "v_wrist_roll":       vels["wrist_roll"],
                 "v_gripper":          vels["gripper"],
-                "v_head_pan":         vels["head_pan"],
-                "v_head_tilt":        vels["head_tilt"],
+                # NOTE: head not driven by sticks (X button uses move_to);
+                # v_head_pan / v_head_tilt would always be 0 → use
+                # joint_head_pan / joint_head_tilt as the head action label.
                 "v_base_forward":     vels["base_v"],
                 "v_base_yaw":         vels["base_w"],
                 "leader":             "robot_gamepad",

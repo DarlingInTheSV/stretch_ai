@@ -215,22 +215,24 @@ Each saved episode produces:
       "base_v_forward": 0.0, "base_v_yaw": 0.002
     },
     "actions": {                           // ← ACTION (commanded, derived from velocity)
-      // 8 absolute targets (= state + v×dt, clipped)
+      // 8 absolute targets — for head these are the AUTHORITATIVE labels
+      // (X-button pose presets bypass the velocity channel)
       "joint_lift": 0.724,
       "joint_arm_l0": 0.003,
       "joint_wrist_yaw":  0.07,
       "joint_wrist_pitch": -0.73,
       "joint_wrist_roll": 0.04,
       "stretch_gripper": 3.23,             // raw, normalize at ETL
-      "joint_head_pan": -0.01,
-      "joint_head_tilt": -1.10,
+      "joint_head_pan": -0.01,             // ⭐ use this as head action label
+      "joint_head_tilt": -1.10,            // ⭐ use this as head action label
       // 2 base deltas in robot-local frame
       "delta_s_robot": 0.0,
       "delta_theta": 0.0,
-      // 10 raw velocities (bonus, not strictly needed for VLA)
-      "v_lift": 0.0, "v_arm": 0.0, "v_wrist_yaw": 0.0, "v_wrist_pitch": 0.0,
-      "v_wrist_roll": 0.0, "v_gripper": 0.0, "v_head_pan": 0.0,
-      "v_head_tilt": 0.0, "v_base_forward": 0.0, "v_base_yaw": 0.0,
+      // 8 raw velocities (bonus; v_head_* dropped — always 0)
+      "v_lift": 0.0, "v_arm": 0.0,
+      "v_wrist_yaw": 0.0, "v_wrist_pitch": 0.0, "v_wrist_roll": 0.0,
+      "v_gripper": 0.0,
+      "v_base_forward": 0.0, "v_base_yaw": 0.0,
       // metadata
       "leader": "robot_gamepad"
     },
@@ -253,13 +255,15 @@ For VLA training schema (14D state, 18D action) you'll need:
 - `gripper_norm = clip(gripper / 70.0, 0, 1)` (or use observed max)
 - Other fields pass through unchanged
 
-**Action 18D from saved 21 fields:**
+**Action 18D from saved 19 fields:**
 - 6 arm absolute (lift/arm/yaw/pitch/roll/gripper_norm) — direct
 - 6 arm delta = absolute − state[t]
-- 2 head absolute (head_pan, head_tilt) — direct
+- 2 head absolute (joint_head_pan, joint_head_tilt) — direct, **AUTHORITATIVE**
+  (do NOT try to use v_head_* — those fields are dropped because X-button
+  head pose changes bypass the velocity channel)
 - 2 head delta = absolute − state[t]
 - 2 base delta (delta_s_robot, delta_theta) — direct
-- (drop the 10 v_* extras at this stage if not used)
+- (drop the 8 v_* extras at this stage if not used)
 
 ---
 

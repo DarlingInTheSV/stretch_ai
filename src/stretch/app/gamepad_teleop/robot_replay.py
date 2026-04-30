@@ -133,9 +133,11 @@ def replay_velocity(robot, frames, fps):
         # Wrist Dynamixels
         for j in ("wrist_yaw", "wrist_pitch", "wrist_roll"):
             robot.end_of_arm.set_velocity(j, a.get(f"v_{j}", 0.0), a_r=ACC_WRIST)
-        # Head Dynamixels
-        for j in ("head_pan", "head_tilt"):
-            robot.head.set_velocity(j, a.get(f"v_{j}", 0.0), a_r=ACC_HEAD)
+        # Head — always use absolute target (X-button head pose moves
+        # bypass our velocity channel; using joint_head_* directly is
+        # the only way to faithfully reproduce head motion).
+        robot.head.get_joint("head_pan" ).move_to(a["joint_head_pan"])
+        robot.head.get_joint("head_tilt").move_to(a["joint_head_tilt"])
         # Gripper move_by (matches recording style)
         vg = a.get("v_gripper", 0.0)
         if abs(vg) > 1e-3:
