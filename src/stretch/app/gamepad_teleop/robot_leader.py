@@ -518,13 +518,28 @@ class StretchController:
     def stop_all(self):
         self.send_velocities({})
 
+    # Custom head poses (override stretch_body defaults)
+    #   'ahead' has tilt=-0.4 (~-23°) so the floor is visible while
+    #     driving / approaching objects.  stretch_body default is (0,0)
+    #     which only sees walls.
+    #   'tool'  matches stretch_body default — looks at the gripper.
+    _HEAD_POSES = {
+        "ahead": (0.0, -0.40),                # (pan, tilt) rad
+        "tool":  (-math.pi / 2, -math.pi / 4),  # -90, -45 deg
+    }
+
     def head_pose(self, name: str):
-        """Move head to a named pose (e.g. 'ahead', 'tool'). Returns ETA in seconds."""
+        """Move head to a named pose. Returns approx motion ETA (seconds)."""
+        if name not in self._HEAD_POSES:
+            print(f"[motor] unknown head pose {name!r}")
+            return 0.0
+        pan, tilt = self._HEAD_POSES[name]
         try:
-            self.robot.head.pose(name)
-            return 1.5  # rough motion duration; suppress velocity-overrides this long
+            self.robot.head.move_to("head_pan",  pan)
+            self.robot.head.move_to("head_tilt", tilt)
+            return 1.5
         except Exception as e:
-            print(f"[motor] head.pose({name!r}) failed: {e}")
+            print(f"[motor] head_pose({name!r}) failed: {e}")
             return 0.0
 
     def shutdown(self):
@@ -658,11 +673,11 @@ def main():
                          "saving. Stretch's D435if is mounted sideways so the "
                          "raw image is rotated; default 90 corrects to "
                          "upright.")
-    ap.add_argument("--video_crf", type=int, default=20,
+    ap.add_argument("--video_crf", type=int, default=15,
                     help="ffmpeg h264 CRF (lower = better quality, bigger "
-                         "file). 18=visually lossless, 23=ffmpeg default, "
-                         "30=FileDataRecorder default (too lossy for VLA). "
-                         "Our default 20 = high quality.")
+                         "file). 12=near-original-quality, 18=visually "
+                         "lossless, 23=ffmpeg default, 30=FileDataRecorder "
+                         "default (too lossy). Our default 15 = very crisp.")
     args = ap.parse_args()
 
     dt = 1.0 / args.fps
